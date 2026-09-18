@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "polarh10-logging"
+dynamic = ["version"]
+description = "Record Polar H10 heart rate and every RR interval to CSV on Windows"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = ["bleak>=3.0,<4"]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio", "pytest-cov", "pyinstaller>=6"]
+
+[project.scripts]
+PolarH10Logging-cli = "polarh10logging.cli:main"
+
+[project.gui-scripts]
+PolarH10Logging = "polarh10logging.gui:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "polarh10logging.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["polarh10logging*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.coverage.run]
+source = ["polarh10logging"]
+omit = ["polarh10logging/gui.py", "polarh10logging/__main__.py"]
