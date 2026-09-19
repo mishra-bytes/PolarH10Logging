@@ -10,6 +10,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable
 
+from . import pmd
 from .hr_parser import HrParseError, HrSample, parse_hr_measurement
 from .keepawake import KeepAwake
 from .logsetup import attach_session_log, detach_session_log
@@ -30,6 +31,30 @@ class State(str, Enum):
     CONNECTED = "connected"
     RECONNECTING = "reconnecting"
     DISCONNECTING = "disconnecting"
+
+
+@dataclass(frozen=True)
+class StreamConfig:
+    """Optional Polar PMD streams. HR/RR always stream."""
+    ecg: bool = False
+    acc: bool = False
+    acc_rate_hz: int = 50
+    acc_range_g: int = 8
+
+    def wanted(self) -> dict[int, tuple[int, int]]:
+        out: dict[int, tuple[int, int]] = {}
+        if self.ecg:
+            out[pmd.ECG] = (pmd.ECG_RATE_HZ, 0)
+        if self.acc:
+            out[pmd.ACC] = (self.acc_rate_hz, self.acc_range_g)
+        return out
+
+
+def _stream_meta(kind: int, rate: int, rng: int) -> dict:
+    if kind == pmd.ECG:
+        return {"sample_rate_hz": rate, "resolution_bits": pmd.ECG_RESOLUTION, "unit": "uV"}
+    return {"sample_rate_hz": rate, "range_g": rng, "resolution_bits": pmd.ACC_RESOLUTION,
+            "unit": "mG"}
 
 
 @dataclass(frozen=True)
@@ -63,6 +88,11 @@ class Snapshot:
     reconnect_left_s: float | None = None
     last_session_folder: Path | None = None
     failure: str | None = None
+    streams_available: frozenset = frozenset()
+    streams_active: frozenset = frozenset()
+    stream_config: StreamConfig = field(default_factory=StreamConfig)
+    ecg_samples: int = 0
+    acc_samples: int = 0
 
 
 @dataclass(frozen=True)
@@ -73,6 +103,9 @@ class Event:
     hr: int | None = None
     rr_ms: tuple[float, ...] = ()
     t_s: float | None = None  # seconds since connection start, for charts
+    stream: int | None = None  # PMD events: pmd.ECG or pmd.ACC
+    values: tuple = ()  # PMD samples: uV, or (x, y, z) mG
+    times_s: tuple = ()  # PMD sample times, seconds since connection start
 
 
 class SessionController:
@@ -99,6 +132,11 @@ class SessionController:
         self._deadline: float | None = None
         self._last_folder: Path | None = None
         self._failure: str | None = None
+        self.stream_config = StreamConfig()
+        self._active: dict[int, tuple[int, int]] = {}  # kind -> (rate, range) now streaming
+        self._clocks: dict[int, pmd.SampleClock] = {}
+        self._pmd_errors: set[int] = set()
+        self._conn_wall0 = 0
 
     # --- helpers ---------------------------------------------------------------------------
     def _refresh(self, **changes) -> Snapshot:
@@ -111,6 +149,8 @@ class SessionController:
             "reconnect_left_s": max(0.0, self._deadline - loop_now) if self._deadline else None,
             "last_session_folder": self._last_folder,
             "failure": self._failure,
+            "streams_active": frozenset(self._active),
+            "stream_config": self.stream_config,
         }
         if w is not None:
             dur, conn = w.durations()
@@ -119,11 +159,16 @@ class SessionController:
                          packets=w.counts["packets"], rr=w.counts["rr"],
                          rr_excluded=w.counts["rr_excluded"],
                          disconnects=w.counts["disconnects"],
-                         hr_min=self.metrics.full.hr_min, hr_max=self.metrics.full.hr_max)
+                         hr_min=self.metrics.full.hr_min, hr_max=self.metrics.full.hr_max,
+                         ecg_samples=w.counts["ecg_samples"], acc_samples=w.counts["acc_samples"])
         else:
             extra.update(session_folder=None, elapsed_s=0.0, connected_pct=None, packets=0,
-                         rr=0, rr_excluded=0, disconnects=0, hr_min=None, hr_max=None)
-        self.snap = replace(self.snap, **extra, **changes)
+                         rr=0, rr_excluded=0, disconnects=0, hr_min=None, hr_max=None,
+                         ecg_samples=0, acc_samples=0)
+        snap = replace(self.snap, **extra, **changes)
+        live = snap.state in (State.CONNECTED, State.RECONNECTING)
+        self.snap = replace(snap, streams_available=frozenset(self.transport.pmd_streams())
+                            if live else frozenset())
         return self.snap
 
     def _emit(self, kind: str, detail: str = "", **kw) -> None:
@@ -181,9 +226,12 @@ class SessionController:
             raise ConnectError(str(last))
         self.metrics = Metrics()
         self._conn_mono0 = self.clock.mono_ms()
+        self._conn_wall0 = self.clock.wall_ms()
+        self._active.clear()
         self._refresh(state=State.CONNECTED, details=details)
         self._emit("state", f"Connected to {device.name} (model {details.model or '?'}, "
                             f"firmware {details.firmware or '?'})")
+        await self._apply_streams()
         await self._update_battery()
         self._battery_task = asyncio.create_task(self._battery_loop())
 
@@ -221,9 +269,84 @@ class SessionController:
             if self.state == State.CONNECTED:
                 await self._update_battery()
 
+    # --- optional ECG / accelerometer streams ----------------------------------------------
+    async def set_streams(self, cfg: StreamConfig) -> None:
+        """Choose ECG/ACC streams. Applied now if connected, otherwise on the next connect."""
+        if cfg.acc:
+            pmd.start_acc_command(cfg.acc_rate_hz, cfg.acc_range_g)  # validate early
+        self.stream_config = cfg
+        if self.state == State.CONNECTED:
+            await self._apply_streams()
+        self._emit("state")
+
+    async def _apply_streams(self) -> None:
+        wanted = self.stream_config.wanted()
+        available = self.transport.pmd_streams()
+        for kind in list(self._active):
+            if wanted.get(kind) != self._active[kind]:
+                await self.transport.stop_stream(kind)
+                del self._active[kind]
+                self._stream_event(kind, None)
+        for kind, (rate, rng) in wanted.items():
+            if kind in self._active:
+                continue
+            name = pmd.STREAM_NAMES[kind]
+            if kind not in available:
+                self._emit("warning", f"{name} is not available on this device")
+                continue
+            try:
+                await self.transport.start_stream(kind, rate, rng)
+            except (pmd.PmdError, ValueError) as e:
+                self._emit("error", f"Could not start {name}: {e}")
+                continue
+            self._active[kind] = (rate, rng)
+            self._clocks[kind] = pmd.SampleClock(rate)
+            self._pmd_errors.discard(kind)
+            self._stream_event(kind, _stream_meta(kind, rate, rng))
+            self._emit("state", f"{name} streaming at {rate} Hz"
+                                + (f", range ±{rng} g" if kind == pmd.ACC else ""))
+
+    def _stream_event(self, kind: int, meta: dict | None) -> None:
+        if self.writer is None:
+            return
+        try:
+            self.writer.set_stream(pmd.STREAM_NAMES[kind], meta)
+        except StorageError as e:
+            self._storage_failed(e)
+
+    def _on_pmd(self, payload: bytes, wall: int, mono: int) -> None:
+        frame: pmd.PmdFrame | None
+        try:
+            frame = pmd.parse_frame(payload)
+        except pmd.PmdError as e:
+            frame = None
+            kind = payload[0] if payload else -1
+            if kind not in self._pmd_errors:  # report once per stream start
+                self._pmd_errors.add(kind)
+                self._emit("error", f"Unreadable sensor frame: {e}")
+        times: list[tuple[int, float]] = []
+        if frame is not None:
+            clk = self._clocks.get(frame.kind)
+            if clk is None:
+                clk = self._clocks[frame.kind] = pmd.SampleClock(
+                    pmd.ECG_RATE_HZ if frame.kind == pmd.ECG else 50)
+            times = clk.sample_times(frame, wall)
+        if self.writer is not None:
+            try:
+                self.writer.write_pmd(wall, mono, payload, frame, times)
+            except StorageError as e:
+                self._storage_failed(e)
+        if frame is not None:
+            w0 = self._conn_wall0
+            self._emit("pmd", stream=frame.kind, values=frame.samples,
+                       times_s=tuple((t - w0) / 1000 for _, t in times))
+
     # --- data path -------------------------------------------------------------------------
     def _on_packet(self, char: str, payload: bytes) -> None:
         wall, mono = self.clock.wall_ms(), self.clock.mono_ms()
+        if char == "PMD":
+            self._on_pmd(payload, wall, mono)
+            return
         sample: HrSample | None
         try:
             sample = parse_hr_measurement(payload)
@@ -253,6 +376,9 @@ class SessionController:
     async def _handle_loss(self) -> None:
         self.metrics.break_chain()
         self._cancel_battery()
+        self._active.clear()
+        for clk in self._clocks.values():
+            clk.reset()
         if self.writer:
             try:
                 self.writer.disconnected("bluetooth link lost")
@@ -285,6 +411,7 @@ class SessionController:
                     except StorageError as e:
                         self._storage_failed(e)
                 self._emit("state", f"Reconnected after {attempt} attempt(s)")
+                await self._apply_streams()
                 await self._update_battery()
                 self._battery_task = asyncio.create_task(self._battery_loop())
                 return
@@ -318,6 +445,8 @@ class SessionController:
         self.writer = writer
         self._failure = None
         self._session_log = attach_session_log(writer.folder)
+        for kind, (rate, rng) in self._active.items():
+            self._stream_event(kind, _stream_meta(kind, rate, rng))
         self.metrics.reset_full()
         self.keep_awake.acquire()
         self._emit("log_started", f"Logging to {writer.folder}")
@@ -384,6 +513,9 @@ class SessionController:
         self._cancel_battery()
         prev = self.state
         self._refresh(state=State.DISCONNECTING)
+        for kind in list(self._active):
+            await self.transport.stop_stream(kind)
+        self._active.clear()
         await self.transport.disconnect()
         self._refresh(state=State.IDLE)
         if prev != State.IDLE:
