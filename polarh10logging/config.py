@@ -28,6 +28,10 @@ class AppConfig:
     metric_window: str = "60 s"
     last_device_id: str = ""
     condition: str = ""
+    ecg: bool = False
+    acc: bool = False
+    acc_rate_hz: int = 50
+    acc_range_g: int = 8
 
     def __post_init__(self) -> None:
         if not self.output_root:
@@ -41,6 +45,10 @@ def load_config(path: Path | None = None) -> AppConfig:
         known = {f.name for f in fields(AppConfig)}
         cfg = AppConfig(**{k: v for k, v in data.items() if k in known})
         cfg.grace_s = max(0, min(86400, int(cfg.grace_s)))
+        if cfg.acc_rate_hz not in (25, 50, 100, 200):
+            cfg.acc_rate_hz = 50
+        if cfg.acc_range_g not in (2, 4, 8):
+            cfg.acc_range_g = 8
         return cfg
     except FileNotFoundError:
         return AppConfig()

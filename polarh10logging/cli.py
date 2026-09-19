@@ -13,7 +13,8 @@ from . import APP_NAME, __version__
 from .config import load_config
 from .logsetup import setup_logging
 from .recover import recover_session
-from .session import Event, LogOptions, SessionController
+from . import pmd
+from .session import Event, LogOptions, SessionController, StreamConfig
 from .storage import StorageError, validate_participant
 from .transport import BleTransport, BluetoothUnavailable, ConnectError, FakeTransport
 
@@ -37,6 +38,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--notes", default="")
     p.add_argument("--duration", type=float, metavar="MIN", help="stop after MIN minutes")
     p.add_argument("--grace", type=int, metavar="SEC", help="reconnect grace period, seconds")
+    p.add_argument("--ecg", action="store_true", help="also record raw ECG (130 Hz)")
+    p.add_argument("--acc", action="store_true", help="also record the accelerometer")
+    p.add_argument("--acc-rate", type=int, default=50, choices=pmd.ACC_RATES_HZ,
+                   help="accelerometer sample rate in Hz (default 50)")
+    p.add_argument("--acc-range", type=int, default=8, choices=pmd.ACC_RANGES_G,
+                   help="accelerometer range in g (default 8)")
     p.add_argument("--fake", action="store_true", help="use a simulated H10")
     p.add_argument("--replay", type=Path, help="with --fake: replay a raw.jsonl file")
     p.add_argument("--replay-speed", type=float, default=1.0)
@@ -52,7 +59,9 @@ def _status_line(c: SessionController) -> str:
     extra = f" reconnecting {s.reconnect_left_s:.0f}s left" if s.reconnect_left_s else ""
     return (f"[{s.elapsed_s / 60:6.1f} min] {s.state.value}{extra}  HR {hr or '-'} bpm  "
             f"packets {s.packets}  RR {s.rr}  RMSSD(60s) {rmssd} ms  battery "
-            f"{s.battery if s.battery is not None else '-'}%")
+            f"{s.battery if s.battery is not None else '-'}%"
+            + (f"  ECG {s.ecg_samples}" if s.ecg_samples else "")
+            + (f"  ACC {s.acc_samples}" if s.acc_samples else ""))
 
 
 async def _record(args: argparse.Namespace) -> int:
@@ -73,6 +82,7 @@ async def _record(args: argparse.Namespace) -> int:
             print(f"{e.kind}: {e.detail}", flush=True)
 
     c = SessionController(transport, on_event, grace_s=grace)
+    c.stream_config = StreamConfig(args.ecg, args.acc, args.acc_rate, args.acc_range)
     print("Scanning...", flush=True)
     try:
         devices = await c.scan()
