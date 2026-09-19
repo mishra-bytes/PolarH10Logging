@@ -79,6 +79,21 @@ the accelerometer about 15 MB per hour at 50 Hz and 60 MB per hour at 200 Hz.
 Live metrics (mean HR, mean RR, SDNN, RMSSD, pNN50) are descriptive values over a window you
 choose. They are **not a medical or diagnostic measurement**.
 
+## If the strap keeps reconnecting
+
+A connect/disconnect loop every few seconds, usually right after ECG or the accelerometer
+starts, has three common causes:
+
+1. **A phone app is holding the strap.** Polar Flow, Polar Beat and similar apps grab it as
+   soon as they see it. Close them, or turn off the phone's Bluetooth.
+2. **Another copy of this app is running.** Only one connection to the strap is possible.
+3. **The link parameters.** Some Windows Bluetooth stacks make the H10 drop the link when the
+   connection parameters are renegotiated. Since 0.2.1 the app only renegotiates when a
+   stream stays silent, and `POLARH10_NO_LINK_TUNE=1` switches it off entirely.
+
+`%LOCALAPPDATA%\PolarH10Logging\logs\app.log` records every connect, drop and retry, which
+is the quickest way to tell these apart.
+
 ## Settings
 
 - **Session folder** where recordings are written.
