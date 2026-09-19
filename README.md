@@ -1,7 +1,8 @@
 # PolarH10 Logging
 
 Windows app that connects to a **Polar H10** chest strap over Bluetooth, shows heart rate and
-RR intervals live, and logs every beat to CSV with UTC timestamps. HR/RR only (no ECG).
+RR intervals live, and logs every beat to CSV with UTC timestamps. Optionally it also streams
+and logs **raw ECG** (130 Hz) and the **accelerometer** (25-200 Hz).
 
 ## Use (team members)
 
@@ -10,6 +11,9 @@ RR intervals live, and logs every beat to CSV with UTC timestamps. HR/RR only (n
 2. Wet the strap electrodes and put the strap on. Close phone apps connected to it.
 3. **Scan**, pick `Polar H10 <ID>`, **Connect**. Live HR, RR and charts appear.
    Nothing is saved yet.
+   Tick **ECG** and/or **Accelerometer** (choose rate and range) under *Extra sensor streams*
+   to stream them; the **ECG** and **Accelerometer** tabs show them live. You can change
+   these at any time, also while logging.
 4. To save, enter a **Participant ID** (a code, not a name) and click **Start logging**.
    Every packet is written to disk immediately.
 5. **Stop logging** finalizes the files. **Open session folder** shows them. You can start
@@ -28,6 +32,7 @@ Files: see [docs/data-format.md](docs/data-format.md). Default folder:
 PolarH10Logging-cli.exe --scan
 PolarH10Logging-cli.exe --record --participant P07 [--device 1C3E0231] [--out DIR]
                         [--condition TEXT] [--notes TEXT] [--duration MIN] [--grace SEC]
+                        [--ecg] [--acc] [--acc-rate 25|50|100|200] [--acc-range 2|4|8]
 PolarH10Logging-cli.exe --fake --record --participant P07 [--replay raw.jsonl]
 PolarH10Logging-cli.exe --recover SESSION_FOLDER
 ```
