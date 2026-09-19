@@ -11,3 +11,4 @@ docs/superpowers/
 output_data/
 .superpowers/
 ble_test_tool.py
+PolarH10Logging/
