@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -32,10 +32,16 @@ class AppConfig:
     acc: bool = False
     acc_rate_hz: int = 50
     acc_range_g: int = 8
+    theme: str = "system"  # system | light | dark
+    auto_rescan: bool = False
+    formats: list[str] = field(default_factory=lambda: ["csv"])
 
     def __post_init__(self) -> None:
         if not self.output_root:
             self.output_root = str(default_output_root())
+        if self.theme not in ("system", "light", "dark"):
+            self.theme = "system"
+        self.formats = [f for f in self.formats if f in ("csv",)] or ["csv"]
 
 
 def load_config(path: Path | None = None) -> AppConfig:
