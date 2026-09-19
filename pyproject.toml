@@ -9,7 +9,7 @@ description = "Record Polar H10 heart rate and every RR interval to CSV on Windo
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"
-dependencies = ["bleak>=3.0,<4"]
+dependencies = ["bleak>=3.0,<4", "pywebview>=6,<7"]
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-asyncio", "pytest-cov", "pyinstaller>=6"]
@@ -18,7 +18,7 @@ dev = ["pytest", "pytest-asyncio", "pytest-cov", "pyinstaller>=6"]
 PolarH10Logging-cli = "polarh10logging.cli:main"
 
 [project.gui-scripts]
-PolarH10Logging = "polarh10logging.gui:main"
+PolarH10Logging = "polarh10logging.webui:main"
 
 [tool.setuptools.dynamic]
 version = { attr = "polarh10logging.__version__" }
@@ -33,4 +33,4 @@ asyncio_default_fixture_loop_scope = "function"
 
 [tool.coverage.run]
 source = ["polarh10logging"]
-omit = ["polarh10logging/gui.py", "polarh10logging/__main__.py"]
+omit = ["polarh10logging/webui.py", "polarh10logging/__main__.py"]

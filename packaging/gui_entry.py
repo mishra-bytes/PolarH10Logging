@@ -1,3 +1,3 @@
-from polarh10logging.gui import main
+from polarh10logging.webui import main
 
 main()
