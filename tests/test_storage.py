@@ -27,7 +27,7 @@ def test_folder_files_and_header(tmp_path, clock):
     with open(w.folder / w.csv_name, encoding="utf-8") as f:
         assert f.readline().rstrip("\n").split(",") == CSV_HEADER
     meta = json.loads((w.folder / "session.json").read_text())
-    assert meta["status"] == "recording" and meta["schema_version"] == 3
+    assert meta["status"] == "recording" and meta["schema_version"] == 4
     assert rows(w)[0]["event"] == "start"
 
 

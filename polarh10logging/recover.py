@@ -28,6 +28,19 @@ def _hr_csv(folder: Path) -> Path | None:
     return next(iter(sorted(folder.glob("HR_*.csv"))), None)
 
 
+def _complete_rows(folder: Path, stream: str) -> int:
+    """Data rows in a stream CSV, ignoring the header and a torn final line."""
+    total = 0
+    for path in folder.glob(f"{stream}_*.csv"):
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError:
+            continue
+        total += max(0, data.count(b"\n") - 1)
+    return total
+
+
 def find_unfinished(root: Path) -> list[Path]:
     out = []
     try:
@@ -98,10 +111,12 @@ def recover_session(folder: Path) -> dict[str, Any]:
             packet[3].append(float(row["rr_ms"]))
     flush_packet()
     counts["rr"], counts["rr_excluded"] = m.rr_count, m.rr_excluded
+    for name in ("ECG", "ACC"):
+        counts[f"{name.lower()}_samples"] = _complete_rows(folder, name)
     full = m.window(None)
     duration = (last - first) / 1000 if first is not None else 0.0
     meta.update({
-        "schema_version": 3, "status": "interrupted", "end_reason": "process_interrupted",
+        "schema_version": 4, "status": "interrupted", "end_reason": "process_interrupted",
         "session_id": meta.get("session_id") or header.get("session_id") or folder.name,
         "participant_id": meta.get("participant_id") or header.get("participant_id"),
         "stop_time_iso": iso_local(last) if last else None, "stop_time_unix_ms": last,
@@ -128,6 +143,7 @@ def recover_session(folder: Path) -> dict[str, Any]:
         "hr_mean": fmt(full.hr_mean), "hr_max": m.full.hr_max, "rr_mean_ms": fmt(full.rr_mean),
         "sdnn_ms": fmt(full.sdnn), "rmssd_ms": fmt(full.rmssd), "pnn50_pct": fmt(full.pnn50),
         "method_note": METHOD_NOTE, "app_version": meta.get("app_version", __version__),
+        "ecg_samples": counts["ecg_samples"], "acc_samples": counts["acc_samples"],
     }
     try:
         with open(folder / SUMMARY_CSV, "w", encoding="utf-8", newline="") as f:

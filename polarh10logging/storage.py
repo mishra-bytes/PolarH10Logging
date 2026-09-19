@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import __version__
+from . import pmd
 from .hr_parser import HrSample
 from .metrics import METHOD_NOTE, WindowMetrics, beat_offsets, rr_accepted
 
@@ -23,14 +24,18 @@ CSV_HEADER = [
     "elapsed_ms", "packet_seq", "segment", "hr_bpm", "rr_index", "rr_ms",
     "beat_time_est_unix_ms", "beat_elapsed_est_ms", "contact", "event", "detail",
 ]
+ECG_HEADER = ["sample_time_utc_iso", "sample_time_unix_ms", "sensor_time_ns",
+              "pc_received_unix_ms", "frame_seq", "segment", "ecg_uv"]
+ACC_HEADER = ["sample_time_utc_iso", "sample_time_unix_ms", "sensor_time_ns",
+              "pc_received_unix_ms", "frame_seq", "segment", "x_mg", "y_mg", "z_mg"]
 SUMMARY_KEYS = [
     "session_id", "participant_id", "condition", "status", "end_reason", "start_time_iso",
     "stop_time_iso", "duration_s", "connected_pct", "device_id", "model", "firmware",
     "battery_start", "battery_end", "packets", "rr_count", "rr_used", "rr_excluded",
     "disconnects", "hr_min", "hr_mean", "hr_max", "rr_mean_ms", "sdnn_ms", "rmssd_ms",
-    "pnn50_pct", "method_note", "app_version",
+    "pnn50_pct", "method_note", "app_version", "ecg_samples", "acc_samples",
 ]
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 RAW_SCHEMA_VERSION = 1
 FSYNC_EVERY_MS = 5000
 CHECKPOINT_EVERY_MS = 30000
@@ -59,6 +64,10 @@ def iso_local(unix_ms: int) -> str:
 def iso_utc(unix_ms: int) -> str:
     dt = datetime.fromtimestamp(unix_ms / 1000, tz=timezone.utc)
     return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{unix_ms % 1000:03d}Z"
+
+
+def iso_utc_float(unix_ms: float) -> str:
+    return iso_utc(int(unix_ms // 1))
 
 
 def local_offset(unix_ms: int) -> str:
@@ -135,7 +144,12 @@ class SessionWriter:
         self.stop_wall: int | None = None
         self.segment = 1
         self.counts = {"packets": 0, "rr": 0, "rr_excluded": 0, "errors": 0,
-                       "disconnects": 0, "segments": 1}
+                       "disconnects": 0, "segments": 1, "ecg_frames": 0, "ecg_samples": 0,
+                       "acc_frames": 0, "acc_samples": 0}
+        self.streams: dict[str, dict[str, Any]] = {}
+        self._stamp = stamp
+        self._stream_files: dict[int, Any] = {}
+        self._stream_csv: dict[int, Any] = {}
         self.recent_events: deque[dict[str, str]] = deque(maxlen=50)
         self._connected_ms = 0
         self._connected_since: int | None = self.start_mono
@@ -159,16 +173,19 @@ class SessionWriter:
         except OSError as e:
             raise StorageError(f"Write failed in {self.folder}: {e}") from e
 
+    def _files(self) -> list[Any]:
+        return [self._csv_f, self._raw_f, *self._stream_files.values()]
+
     def _flush(self, mono: int) -> None:
-        self._guard(self._csv_f.flush)
-        self._guard(self._raw_f.flush)
+        for f in self._files():
+            self._guard(f.flush)
         if mono - self._last_fsync >= FSYNC_EVERY_MS:
             self._fsync()
             self._last_fsync = mono
 
     def _fsync(self) -> None:
-        self._guard(os.fsync, self._csv_f.fileno())
-        self._guard(os.fsync, self._raw_f.fileno())
+        for f in self._files():
+            self._guard(os.fsync, f.fileno())
 
     def _base_row(self, wall: int, mono: int) -> list[Any]:
         return [self.session_id, self.participant_id, iso_local(wall), iso_utc(wall), wall,
@@ -202,6 +219,53 @@ class SessionWriter:
                     wall - (elapsed - beat_el), beat_el, contact, "", ""])
         self._flush(mono)
         self.maybe_checkpoint(mono)
+
+    def _stream_writer(self, kind: int):
+        w = self._stream_csv.get(kind)
+        if w is None:
+            name = f"{pmd.STREAM_NAMES[kind]}_{self.participant_id}_{self._stamp}.csv"
+            try:
+                f = open(self.folder / name, "w", encoding="utf-8", newline="")
+            except OSError as e:
+                raise StorageError(f"Could not open {name}: {e}") from e
+            self._stream_files[kind] = f
+            w = self._stream_csv[kind] = csv.writer(f, lineterminator="\n")
+            self._guard(w.writerow, ECG_HEADER if kind == pmd.ECG else ACC_HEADER)
+        return w
+
+    def write_pmd(self, wall: int, mono: int, payload: bytes, frame: pmd.PmdFrame | None,
+                  times: list[tuple[int, float]]) -> None:
+        """Raw record first, then one CSV row per sample in the stream's own file."""
+        raw = {"schema_version": RAW_SCHEMA_VERSION, "pc_time_unix_ms": wall,
+               "elapsed_ms": mono - self.start_mono, "device_id": self.device.get("device_id"),
+               "characteristic": "PMD", "payload_hex": payload.hex()}
+        self._guard(self._raw_f.write, json.dumps(raw) + "\n")
+        if frame is not None and frame.kind in pmd.STREAM_NAMES:
+            name = pmd.STREAM_NAMES[frame.kind].lower()
+            self.counts[f"{name}_frames"] += 1
+            self.counts[f"{name}_samples"] += len(frame.samples)
+            seq = self.counts[f"{name}_frames"]
+            w = self._stream_writer(frame.kind)
+            rows = []
+            for sample, (ns, unix_ms) in zip(frame.samples, times):
+                vals = list(sample) if frame.kind == pmd.ACC else [sample]
+                rows.append([iso_utc_float(unix_ms), f"{unix_ms:.3f}", ns, wall, seq,
+                             self.segment, *vals])
+            self._guard(w.writerows, rows)
+        self._flush(mono)
+        self.maybe_checkpoint(mono)
+
+    def set_stream(self, name: str, config: dict[str, Any] | None) -> None:
+        """Record a stream start (config) or stop (None) in metadata and the event log."""
+        if config is None:
+            if name in self.streams:
+                self.streams[name]["active"] = False
+            self.write_event("stream", f"{name} stopped")
+        else:
+            self.streams[name] = {**config, "active": True}
+            detail = ", ".join(f"{k}={v}" for k, v in config.items())
+            self.write_event("stream", f"{name} started ({detail})" if detail else
+                             f"{name} started")
 
     def write_event(self, kind: str, detail: str = "") -> None:
         wall, mono = self.clock.wall_ms(), self.clock.mono_ms()
@@ -271,7 +335,8 @@ class SessionWriter:
             "stop_time_unix_ms": self.stop_wall,
             "duration_s": round(duration, 3), "connected_s": round(connected, 3),
             "reconnect_grace_s": self.grace_s, "pc_timezone": local_offset(self.start_wall),
-            "counts": dict(self.counts), "recent_events": list(self.recent_events),
+            "counts": dict(self.counts), "streams": self.streams,
+            "recent_events": list(self.recent_events),
             "files": files,
         }
 
@@ -295,6 +360,7 @@ class SessionWriter:
             "rr_mean_ms": _fmt(full.rr_mean), "sdnn_ms": _fmt(full.sdnn),
             "rmssd_ms": _fmt(full.rmssd), "pnn50_pct": _fmt(full.pnn50),
             "method_note": METHOD_NOTE, "app_version": __version__,
+            "ecg_samples": self.counts["ecg_samples"], "acc_samples": self.counts["acc_samples"],
         }
         return [(k, "" if vals[k] is None else str(vals[k])) for k in SUMMARY_KEYS]
 
@@ -321,8 +387,8 @@ class SessionWriter:
 
         attempt(lambda: self.write_event("stop", end_reason))
         attempt(self._fsync)
-        attempt(self._csv_f.close)
-        attempt(self._raw_f.close)
+        for f in self._files():
+            attempt(f.close)
         attempt(lambda: self._write_summary(full, hr_min, hr_max))
         attempt(lambda: self.checkpoint(force=True))
         if errors:
@@ -330,7 +396,7 @@ class SessionWriter:
             raise e if isinstance(e, StorageError) else StorageError(str(e))
 
     def close_quietly(self) -> None:
-        for f in (self._csv_f, self._raw_f):
+        for f in self._files():
             try:
                 f.close()
             except Exception:  # noqa: BLE001
