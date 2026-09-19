@@ -7,21 +7,27 @@ and logs **raw ECG** (130 Hz) and the **accelerometer** (25-200 Hz).
 ## Use (team members)
 
 1. Copy `PolarH10Logging.exe` anywhere and double-click it. No install or Python needed.
-   Windows SmartScreen may warn because the file is unsigned: **More info → Run anyway**.
+   Windows SmartScreen may warn because the file is unsigned: **More info -> Run anyway**.
 2. Wet the strap electrodes and put the strap on. Close phone apps connected to it.
-3. **Scan**, pick `Polar H10 <ID>`, **Connect**. Live HR, RR and charts appear.
-   Nothing is saved yet.
-   Tick **ECG** and/or **Accelerometer** (choose rate and range) under *Extra sensor streams*
-   to stream them; the **ECG** and **Accelerometer** tabs show them live. You can change
-   these at any time, also while logging.
-4. To save, enter a **Participant ID** (a code, not a name) and click **Start logging**.
+3. **Find my Polar H10**, then **Connect** on your strap. The last strap you used is
+   remembered and preselected, so the next session is one click. Live heart rate, RR and
+   charts appear. Nothing is saved yet.
+   Turn on **ECG** and/or **Accelerometer** in the *Streams* card (rate and range are next to
+   it) to stream them; the **ECG** and **Motion** chart tabs show them live. You can change
+   these at any time, also while recording.
+4. To save, enter a **Participant ID** (a code, not a name) and click **Start recording**.
    Every packet is written to disk immediately.
-5. **Stop logging** finalizes the files. **Open session folder** shows them. You can start
-   another log on the same connection. **Disconnect** when done.
+5. **Stop recording** asks for confirmation, then finalizes the files and shows where they
+   are. You can start another recording on the same connection. **Disconnect** when done.
 
-If the strap drops out, the app keeps trying to reconnect for the **Reconnect grace**
-period (default 120 s) and continues the same log; after that the log is finalized.
-If the PC crashes, the next start marks the session as interrupted and rebuilds its summary.
+If the strap drops out, the app keeps the recording open and retries for the **grace period**
+(Settings, default 2 minutes). A banner counts the time down and offers **Retry now**,
+**Extend +2 min** and **Stop and save now**. After the grace period the recording is
+finalized. If the PC crashes, the next start marks the session as interrupted, rebuilds its
+summary and says so.
+
+Settings holds the output folder, the grace period, the theme (system, light or dark) and the
+output formats. CSV is written today; JSON Lines and Parquet are marked *coming next*.
 
 Files: see [docs/data-format.md](docs/data-format.md). Default folder:
 `Documents\PolarH10Logging`.
@@ -46,9 +52,14 @@ output folder, 5 storage failure, 6 recovery failure.
 py -3.12 -m venv .venv
 .\.venv\Scripts\python -m pip install -e ".[dev]"
 .\.venv\Scripts\python -m pytest
-.\.venv\Scripts\python -m polarh10logging --fake   # GUI with a simulated strap
+.\.venv\Scripts\python -m polarh10logging --fake   # app window with a simulated strap
 .\build.ps1                                        # tests + dist\*.exe
 ```
+
+The window is a WebView2 view (pywebview) over the Python session controller: the page in
+`polarh10logging/web/` renders every screen and polls `Api.poll()` in `webui.py` a few times a
+second. WebView2 ships with Windows 11 and recent Windows 10; on an older PC install the
+Microsoft Edge WebView2 Runtime.
 
 ## Privacy
 
