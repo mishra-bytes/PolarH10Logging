@@ -106,6 +106,7 @@ class Api:
         self.saved: dict | None = None  # summary of the recording that just finished
         self.lost: dict | None = None  # set when the grace period ran out
         self.closing = False
+        self.ui_ready = False
         self.hr_pts: deque[tuple[float, float]] = deque()
         self.rr_pts: deque[tuple[float, float]] = deque()
         self.ecg_pts: deque[tuple[float, float]] = deque()
@@ -217,6 +218,9 @@ class Api:
 
     # --- state for the page --------------------------------------------------------------
     def poll(self, tab: str = "hr") -> dict:
+        if not self.ui_ready:  # first call from the page: the window really did load
+            self.ui_ready = True
+            log.info("UI ready")
         s = self.snap
         dev, det = s.device, s.details
         live = s.state in (State.CONNECTED, State.RECONNECTING)

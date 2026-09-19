@@ -1,9 +1,11 @@
 # PyInstaller build: PolarH10Logging.exe (windowed) and PolarH10Logging-cli.exe (console).
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 hidden = (collect_submodules("bleak") + collect_submodules("winrt")
           + collect_submodules("webview") + ["clr_loader", "pythonnet"])
-web = [("polarh10logging/web", "polarh10logging/web")]
+# pywebview ships its bridge as .js files, which are data, not modules
+web = ([("polarh10logging/web", "polarh10logging/web")]
+       + collect_data_files("webview"))
 
 
 def build(script, name, console):
