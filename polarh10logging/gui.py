@@ -7,6 +7,7 @@ import concurrent.futures
 import logging
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -19,9 +20,10 @@ from tkinter import filedialog, messagebox, ttk
 from . import APP_NAME, __version__
 from .config import AppConfig, load_config, save_config
 from .logsetup import setup_logging
+from . import pmd
 from .metrics import WINDOW_CHOICES
 from .recover import recover_interrupted
-from .session import Event, LogOptions, SessionController, Snapshot, State
+from .session import Event, LogOptions, SessionController, Snapshot, State, StreamConfig
 from .storage import StorageError, validate_participant
 from .transport import BleTransport, BluetoothUnavailable, ConnectError, DeviceInfo, FakeTransport
 
@@ -29,13 +31,16 @@ log = logging.getLogger(__name__)
 REFRESH_MS = 500  # live values redraw at most twice per second
 POLL_MS = 100
 CHART_SPAN_S = 300
-GAP_S = 5.0
+ECG_SPAN_S = 6
+ACC_SPAN_S = 20
+GAP_S = 2.0
 CLOSE_TIMEOUT_S = 20
 NO_DEVICE_TIPS = ("No Polar H10 found.\n\n• Wear the strap and wet the electrodes.\n"
                   "• Move closer to the PC.\n• Close other apps or phones connected to the "
                   "strap (or enable dual Bluetooth in the Polar app).")
 
 COLORS = {"hr": "#d62839", "rr": "#1f6feb", "grid": "#e3e3e3", "axis": "#6b6b6b",
+          "ecg": "#0b7a3e", "x": "#d62839", "y": "#2e7d32", "z": "#1f6feb",
           "amber": "#f5b700", "red": "#c62828", "rec": "#d62839", "ok": "#2e7d32"}
 
 
@@ -62,34 +67,50 @@ class AsyncRunner:
 
 
 class Chart(tk.Canvas):
-    """Minimal scrolling line chart with auto-scaled y axis."""
+    """Minimal scrolling line chart with auto-scaled y axis and optional several series."""
 
-    def __init__(self, master, title: str, unit: str, color: str, scale: float = 1.0,
-                 **kw) -> None:
+    def __init__(self, master, title: str, unit: str, scale: float = 1.0, *,
+                 span_s: float = CHART_SPAN_S, tick_s: float = 60, min_pad: float = 5.0,
+                 empty: str = "No data yet - Scan, then Connect", **kw) -> None:
         super().__init__(master, background="white", highlightthickness=1,
                          highlightbackground="#cccccc", **kw)
-        self.title, self.unit, self.color, self.k = title, unit, color, scale
+        self.title, self.unit, self.k = title, unit, scale
+        self.span_s, self.tick_s, self.min_pad, self.empty = span_s, tick_s, min_pad, empty
 
-    def draw(self, points: deque[tuple[float, float]], now_s: float) -> None:
+    def _tick_label(self, secs: float) -> str:
+        if secs == 0:
+            return "now"
+        return f"-{secs / 60:g}m" if self.tick_s >= 60 else f"-{secs:g}s"
+
+    def draw(self, series: list[tuple[deque, str, str]], now_s: float,
+             message: str | None = None) -> None:
+        """series: [(points (t, value), color, legend label), ...]"""
         self.delete("all")
         w, h = self.winfo_width(), self.winfo_height()
         if w < 50 or h < 40:
             return
         k = self.k
-        left, right, top, bottom = int(44 * k), int(22 * k), int(24 * k), int(20 * k)
+        left, right, top, bottom = int(50 * k), int(22 * k), int(24 * k), int(20 * k)
         pw, ph = w - left - right, h - top - bottom
         if pw < 20 or ph < 20:
             return
         self.create_text(left, int(4 * k), anchor="nw", text=f"{self.title} ({self.unit})",
                          fill=COLORS["axis"], font=("Segoe UI", 9, "bold"))
-        t0 = now_s - CHART_SPAN_S
-        vis = [(t, v) for t, v in points if t >= t0]
-        if not vis:
-            self.create_text(w / 2, h / 2, text="No data yet - Scan, then Connect",
-                             fill=COLORS["axis"], font=("Segoe UI", 10))
+        x_leg = w - right
+        for _, color, label in reversed(series):
+            if label:
+                t = self.create_text(x_leg, int(4 * k), anchor="ne", text=label, fill=color,
+                                     font=("Segoe UI", 9, "bold"))
+                x_leg = self.bbox(t)[0] - int(10 * k)
+        t0 = now_s - self.span_s
+        vis = [[(t, v) for t, v in pts if t >= t0] for pts, _, _ in series]
+        values = [v for pts in vis for _, v in pts]
+        if message or not values:
+            self.create_text(w / 2, h / 2, text=message or self.empty, fill=COLORS["axis"],
+                             font=("Segoe UI", 10))
             return
-        lo, hi = min(v for _, v in vis), max(v for _, v in vis)
-        pad = max((hi - lo) * 0.15, 5.0 if self.unit == "bpm" else 20.0)
+        lo, hi = min(values), max(values)
+        pad = max((hi - lo) * 0.15, self.min_pad)
         lo, hi = lo - pad, hi + pad
         for i in range(5):  # horizontal grid
             v = lo + (hi - lo) * i / 4
@@ -97,28 +118,34 @@ class Chart(tk.Canvas):
             self.create_line(left, y, left + pw, y, fill=COLORS["grid"])
             self.create_text(left - 4, y, anchor="e", text=f"{v:.0f}", fill=COLORS["axis"],
                              font=("Segoe UI", 8))
-        for m in range(0, CHART_SPAN_S // 60 + 1):  # minute ticks
-            x = left + pw * (1 - m * 60 / CHART_SPAN_S)
+        n_ticks = int(self.span_s // self.tick_s)
+        for m in range(n_ticks + 1):  # time ticks
+            x = left + pw * (1 - m * self.tick_s / self.span_s)
             self.create_line(x, top, x, top + ph, fill=COLORS["grid"])
-            self.create_text(x, top + ph + 2, anchor="n", text="now" if m == 0 else f"-{m}m",
+            self.create_text(x, top + ph + 2, anchor="n", text=self._tick_label(m * self.tick_s),
                              fill=COLORS["axis"], font=("Segoe UI", 8))
-        seg: list[float] = []
-        prev_t = None
-        for t, v in vis:
-            x = left + pw * (t - t0) / CHART_SPAN_S
-            y = top + ph - ph * (v - lo) / (hi - lo)
-            if prev_t is not None and t - prev_t > GAP_S and len(seg) >= 4:
-                self.create_line(*seg, fill=self.color, width=max(1, round(1.5 * k)))
-                seg = []
-            elif prev_t is not None and t - prev_t > GAP_S:
-                seg = []
-            seg += [x, y]
-            prev_t = t
-        if len(seg) >= 4:
-            self.create_line(*seg, fill=self.color, width=max(1, round(1.5 * k)))
-        elif len(seg) == 2:
-            self.create_oval(seg[0] - 2, seg[1] - 2, seg[0] + 2, seg[1] + 2, fill=self.color,
-                             outline="")
+        width = max(1, round(1.5 * k))
+        max_pts = max(200, pw * 2)
+        for pts, (_, color, _) in zip(vis, series):
+            if len(pts) > max_pts:  # thin for drawing only; stored data is untouched
+                step = len(pts) / max_pts
+                pts = [pts[int(i * step)] for i in range(max_pts)]
+            seg: list[float] = []
+            prev_t = None
+            for t, v in pts:
+                x = left + pw * (t - t0) / self.span_s
+                y = top + ph - ph * (v - lo) / (hi - lo)
+                if prev_t is not None and t - prev_t > GAP_S:
+                    if len(seg) >= 4:
+                        self.create_line(*seg, fill=color, width=width)
+                    seg = []
+                seg += [x, y]
+                prev_t = t
+            if len(seg) >= 4:
+                self.create_line(*seg, fill=color, width=width)
+            elif len(seg) == 2:
+                self.create_oval(seg[0] - 2, seg[1] - 2, seg[0] + 2, seg[1] + 2, fill=color,
+                                 outline="")
 
 
 class App:
@@ -133,6 +160,11 @@ class App:
         self.snap = Snapshot()
         self.hr_pts: deque[tuple[float, float]] = deque()
         self.rr_pts: deque[tuple[float, float]] = deque()
+        self.ecg_pts: deque[tuple[float, float]] = deque()
+        self.acc_pts = {axis: deque() for axis in "xyz"}
+        self.ecg_now = self.acc_now = 0.0
+        self.ctrl.stream_config = StreamConfig(self.cfg.ecg, self.cfg.acc, self.cfg.acc_rate_hz,
+                                               self.cfg.acc_range_g)
         self.now_s = 0.0
         self.dirty = True
         self.busy = False
@@ -183,6 +215,30 @@ class App:
         self.state_lbl.pack(side="left", padx=12)
         ttk.Button(dev, text="About", command=self.on_about).pack(side="right")
 
+        st = ttk.Frame(outer)
+        st.pack(fill="x", pady=(6, 0))
+        ttk.Label(st, text="Extra sensor streams:", style="Head.TLabel").pack(side="left")
+        self.ecg_var = tk.BooleanVar(value=self.cfg.ecg)
+        self.acc_var = tk.BooleanVar(value=self.cfg.acc)
+        self.acc_rate_var = tk.StringVar(value=str(self.cfg.acc_rate_hz))
+        self.acc_range_var = tk.StringVar(value=f"±{self.cfg.acc_range_g} g")
+        ttk.Checkbutton(st, text="ECG (130 Hz)", variable=self.ecg_var,
+                        command=self.on_streams).pack(side="left", padx=(10, 0))
+        ttk.Checkbutton(st, text="Accelerometer", variable=self.acc_var,
+                        command=self.on_streams).pack(side="left", padx=(16, 4))
+        ttk.Label(st, text="rate").pack(side="left")
+        cmb_rate = ttk.Combobox(st, textvariable=self.acc_rate_var, state="readonly", width=5,
+                                values=[str(r) for r in pmd.ACC_RATES_HZ])
+        cmb_rate.pack(side="left", padx=(4, 2))
+        ttk.Label(st, text="Hz   range").pack(side="left")
+        cmb_range = ttk.Combobox(st, textvariable=self.acc_range_var, state="readonly", width=6,
+                                 values=[f"±{g} g" for g in pmd.ACC_RANGES_G])
+        cmb_range.pack(side="left", padx=4)
+        for cmb in (cmb_rate, cmb_range):
+            cmb.bind("<<ComboboxSelected>>", lambda e: self.on_streams())
+        self.streams_lbl = ttk.Label(st, text="", foreground=COLORS["axis"])
+        self.streams_lbl.pack(side="left", padx=12)
+
         self.banner = tk.Label(outer, text="", anchor="w", padx=8, pady=4,
                                font=("Segoe UI", 10, "bold"))
 
@@ -207,12 +263,25 @@ class App:
         self.devinfo_lbl = ttk.Label(left, text="", foreground=COLORS["axis"])
         self.devinfo_lbl.pack(anchor="w", pady=(6, 0))
 
-        charts = ttk.Frame(live)
-        charts.pack(side="left", fill="both", expand=True, padx=(12, 0))
-        self.hr_chart = Chart(charts, "Heart rate", "bpm", COLORS["hr"], k, height=int(150 * k))
+        self.tabs = ttk.Notebook(live)
+        self.tabs.pack(side="left", fill="both", expand=True, padx=(12, 0))
+        charts = ttk.Frame(self.tabs, padding=4)
+        self.tabs.add(charts, text="  HR & RR  ")
+        self.hr_chart = Chart(charts, "Heart rate", "bpm", k, height=int(140 * k))
         self.hr_chart.pack(fill="both", expand=True)
-        self.rr_chart = Chart(charts, "RR interval", "ms", COLORS["rr"], k, height=int(150 * k))
+        self.rr_chart = Chart(charts, "RR interval", "ms", k, min_pad=20.0, height=int(140 * k))
         self.rr_chart.pack(fill="both", expand=True, pady=(6, 0))
+        ecg_tab = ttk.Frame(self.tabs, padding=4)
+        self.tabs.add(ecg_tab, text="  ECG  ")
+        self.ecg_chart = Chart(ecg_tab, "ECG", "µV", k, span_s=ECG_SPAN_S, tick_s=1,
+                               min_pad=100.0, height=int(280 * k))
+        self.ecg_chart.pack(fill="both", expand=True)
+        acc_tab = ttk.Frame(self.tabs, padding=4)
+        self.tabs.add(acc_tab, text="  Accelerometer  ")
+        self.acc_chart = Chart(acc_tab, "Acceleration", "mG", k, span_s=ACC_SPAN_S, tick_s=5,
+                               min_pad=50.0, height=int(280 * k))
+        self.acc_chart.pack(fill="both", expand=True)
+        self.tabs.bind("<<NotebookTabChanged>>", lambda e: setattr(self, "dirty", True))
 
         met = ttk.Frame(outer)
         met.pack(fill="x", pady=(6, 0))
@@ -309,6 +378,9 @@ class App:
         self.cfg.output_root = self.out_var.get().strip() or self.cfg.output_root
         self.cfg.condition = self.cond_var.get().strip()
         self.cfg.metric_window = self.window_var.get()
+        cfg = self._stream_config()
+        self.cfg.ecg, self.cfg.acc = cfg.ecg, cfg.acc
+        self.cfg.acc_rate_hz, self.cfg.acc_range_g = cfg.acc_rate_hz, cfg.acc_range_g
         try:
             self.cfg.grace_s = max(0, min(86400, int(self.grace_var.get())))
         except ValueError:
@@ -369,7 +441,9 @@ class App:
             while True:
                 e = self.events.get_nowait()
                 self.snap = e.snapshot
-                if e.kind == "packet":
+                if e.kind == "pmd":
+                    self._add_pmd(e)
+                elif e.kind == "packet":
                     t = e.t_s or 0.0
                     self.now_s = t
                     if e.hr is not None:
@@ -391,7 +465,10 @@ class App:
                             "Connected to" in e.detail:
                         self.hr_pts.clear()
                         self.rr_pts.clear()
-                        self.now_s = 0.0
+                        self.ecg_pts.clear()
+                        for d in self.acc_pts.values():
+                            d.clear()
+                        self.now_s = self.ecg_now = self.acc_now = 0.0
                     if e.detail:
                         self._add_event(e.kind, e.detail)
                     self._apply_state()
@@ -400,6 +477,24 @@ class App:
             pass
         if not self.closing:
             self.root.after(POLL_MS, self._poll)
+
+    def _add_pmd(self, e: Event) -> None:
+        if not e.times_s:
+            return
+        if e.stream == pmd.ECG:
+            self.ecg_pts.extend(zip(e.times_s, e.values))
+            self.ecg_now = e.times_s[-1]
+            cutoff = self.ecg_now - ECG_SPAN_S - 1
+            while self.ecg_pts and self.ecg_pts[0][0] < cutoff:
+                self.ecg_pts.popleft()
+        elif e.stream == pmd.ACC:
+            for axis, i in (("x", 0), ("y", 1), ("z", 2)):
+                self.acc_pts[axis].extend((t, v[i]) for t, v in zip(e.times_s, e.values))
+            self.acc_now = e.times_s[-1]
+            cutoff = self.acc_now - ACC_SPAN_S - 1
+            for d in self.acc_pts.values():
+                while d and d[0][0] < cutoff:
+                    d.popleft()
 
     def _refresh_loop(self) -> None:
         if self.dirty:
@@ -438,7 +533,10 @@ class App:
             self.sess_lbl.configure(
                 text=f"Packets {s.packets}   RR {s.rr}   Excluded RR {s.rr_excluded}   "
                      f"Disconnects {s.disconnects}   Connected {pct}   HR min/max "
-                     f"{s.hr_min or '--'}/{s.hr_max or '--'}   →  {s.session_folder}")
+                     f"{s.hr_min or '--'}/{s.hr_max or '--'}"
+                     + (f"   ECG {s.ecg_samples}" if s.ecg_samples else "")
+                     + (f"   ACC {s.acc_samples}" if s.acc_samples else "")
+                     + f"   →  {s.session_folder}")
         else:
             self.rec_lbl.configure(text="")
             self.sess_lbl.configure(text=f"Last log: {s.last_session_folder}"
@@ -458,9 +556,18 @@ class App:
             self.dirty = True  # keep countdown ticking
         else:
             self.banner.pack_forget()
-        now = self.now_s
-        self.hr_chart.draw(self.hr_pts, now)
-        self.rr_chart.draw(self.rr_pts, now)
+        tab = self.tabs.index(self.tabs.select())
+        if tab == 0:
+            self.hr_chart.draw([(self.hr_pts, COLORS["hr"], "")], self.now_s)
+            self.rr_chart.draw([(self.rr_pts, COLORS["rr"], "")], self.now_s)
+        elif tab == 1:
+            self.ecg_chart.draw([(self.ecg_pts, COLORS["ecg"], "")], self.ecg_now,
+                                self._stream_message(pmd.ECG, "ECG"))
+        else:
+            self.acc_chart.draw([(self.acc_pts[a], COLORS[a], a) for a in "xyz"], self.acc_now,
+                                self._stream_message(pmd.ACC, "Accelerometer"))
+        on = [pmd.STREAM_NAMES[k] for k in sorted(s.streams_active)]
+        self.streams_lbl.configure(text=("Streaming: " + ", ".join(on)) if on else "")
 
     # --- actions ---------------------------------------------------------------------------
     def on_scan(self) -> None:
@@ -504,6 +611,35 @@ class App:
                 APP_NAME, "A log is running. Stop logging and disconnect?", parent=self.root):
             return
         self._run(self.ctrl.disconnect())
+
+    def _stream_config(self) -> StreamConfig:
+        try:
+            rate = int(self.acc_rate_var.get())
+        except ValueError:
+            rate = 50
+        rng = int(re.sub(r"\D", "", self.acc_range_var.get()) or 8)
+        return StreamConfig(self.ecg_var.get(), self.acc_var.get(), rate, rng)
+
+    def _stream_message(self, kind: int, name: str) -> str | None:
+        s = self.snap
+        if s.state not in (State.CONNECTED, State.RECONNECTING):
+            return None
+        if kind not in s.streams_active:
+            if s.streams_available and kind not in s.streams_available:
+                return f"{name} is not available on this device"
+            return f"{name} is off - tick it in 'Extra sensor streams' above"
+        return None
+
+    def on_streams(self) -> None:
+        cfg = self._stream_config()
+        self._save_cfg()
+        fut = self.runner.submit(self.ctrl.set_streams(cfg))
+
+        def done(f: concurrent.futures.Future) -> None:
+            if f.exception() and not self.closing:
+                self.root.after(0, lambda: self._add_event("error", str(f.exception())))
+        fut.add_done_callback(done)
+        self.dirty = True
 
     def on_window(self) -> None:
         self.runner.call(self.ctrl.set_window, self.window_var.get())
