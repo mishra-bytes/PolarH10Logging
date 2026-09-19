@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import math
+import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,9 @@ from typing import Callable, Protocol
 
 from . import pmd
 from .hr_parser import encode_hr_measurement
+
+NO_LINK_TUNE_ENV = "POLARH10_NO_LINK_TUNE"  # set to 1 to never renegotiate the link
+FIRST_SAMPLE_GRACE_S = 6.0  # how long a stream may stay silent before we renegotiate
 
 log = logging.getLogger(__name__)
 
@@ -91,6 +95,8 @@ class BleTransport:
         self._found: dict[str, object] = {}  # device_id -> BLEDevice
         self._client = None
         self._user_disconnect = False
+        self._pmd_seen = False  # has any ECG/ACC sample arrived on this connection?
+        self._sample_watch = None
         self._pmd: set[int] = set()
         self._cp_queue: asyncio.Queue[bytes] | None = None
         self._cp_lock = asyncio.Lock()
@@ -153,7 +159,7 @@ class BleTransport:
             return details
         except ConnectError:
             raise
-        except (BleakError, OSError, asyncio.TimeoutError) as e:
+        except Exception as e:  # noqa: BLE001 - bleak can raise AssertionError on a flaky link
             await self.disconnect()
             raise ConnectError(str(e) or type(e).__name__) from e
 
@@ -168,8 +174,11 @@ class BleTransport:
             self._cp_queue = asyncio.Queue()
             q = self._cp_queue
             await client.start_notify(pmd.PMD_CONTROL_UUID, lambda _c, d: q.put_nowait(bytes(d)))
-            await client.start_notify(pmd.PMD_DATA_UUID,
-                                      lambda _c, d: on_packet("PMD", bytes(d)))
+
+            def _pmd_data(_c, d) -> None:
+                self._pmd_seen = True
+                on_packet("PMD", bytes(d))
+            await client.start_notify(pmd.PMD_DATA_UUID, _pmd_data)
             self._pmd = pmd.supported_streams(features)
         except Exception as e:  # noqa: BLE001
             log.warning("PMD unavailable: %s", e)
@@ -195,12 +204,20 @@ class BleTransport:
     def _tune_link(self) -> None:
         """Ask Windows for 'balanced' connection parameters (Windows 11+).
 
-        Measured on an H10 (fw 5.0.0): the strap holds ECG/ACC data until a connection
+        Measured on an H10 (fw 5.0.0): the strap can hold ECG/ACC data until a connection
         parameter update completes, which otherwise stalls for about 30 s after connecting.
         Requesting balanced parameters completes it at once and data flows within ~2 s.
-        ThroughputOptimized and PowerOptimized both made the H10 drop the link.
+        ThroughputOptimized and PowerOptimized both made the H10 drop the link, and on some
+        machines balanced does too - the strap disconnects a few hundred ms later, every
+        time, which looks like a rapid connect/disconnect loop. So this is a rescue, not a
+        routine step: it runs only when no sample has arrived a few seconds after a stream
+        started. See _watch_first_samples.
         """
         if self._link_tuned or self._client is None:
+            return
+        if os.environ.get(NO_LINK_TUNE_ENV):
+            self._link_tuned = True
+            log.info("connection parameter request skipped (%s set)", NO_LINK_TUNE_ENV)
             return
         self._link_tuned = True
         try:
@@ -213,7 +230,6 @@ class BleTransport:
             log.info("connection parameter request unavailable: %s", e)
 
     async def start_stream(self, kind: int, rate_hz: int = 0, range_g: int = 0) -> None:
-        self._tune_link()
         if kind not in self._pmd:
             raise pmd.PmdError(f"{pmd.STREAM_NAMES.get(kind, kind)} not supported by this device")
         cmd = (pmd.start_ecg_command() if kind == pmd.ECG
@@ -225,6 +241,23 @@ class BleTransport:
                 raise
             await self._pmd_command(pmd.stop_command(kind))  # restart with new settings
             await self._pmd_command(cmd)
+        self._watch_first_samples()
+
+    def _watch_first_samples(self) -> None:
+        """If no sample arrives soon, ask Windows to renegotiate the link once."""
+        if self._pmd_seen or self._link_tuned or self._sample_watch is not None:
+            return
+        self._sample_watch = asyncio.get_running_loop().create_task(self._rescue_link())
+
+    async def _rescue_link(self) -> None:
+        try:
+            await asyncio.sleep(FIRST_SAMPLE_GRACE_S)
+            if not self._pmd_seen and self._client is not None:
+                log.warning("no sensor data after %.0f s; renegotiating the link",
+                            FIRST_SAMPLE_GRACE_S)
+                self._tune_link()
+        finally:
+            self._sample_watch = None
 
     async def stop_stream(self, kind: int) -> None:
         try:
@@ -249,6 +282,10 @@ class BleTransport:
     async def disconnect(self) -> None:
         self._pmd = set()
         self._link_tuned = False
+        self._pmd_seen = False
+        watch, self._sample_watch = self._sample_watch, None
+        if watch is not None:
+            watch.cancel()
         self._cp_queue = None
         client, self._client = self._client, None
         if client is None:
