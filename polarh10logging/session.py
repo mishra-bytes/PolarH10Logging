@@ -86,6 +86,9 @@ class Snapshot:
     hr_min: int | None = None
     hr_max: int | None = None
     reconnect_left_s: float | None = None
+    connect_attempt: int = 0  # attempt number while CONNECTING (0 when not connecting)
+    connect_attempts: int = 0  # how many connect attempts are made in total
+    reconnect_attempt: int = 0  # attempt number while RECONNECTING
     last_session_folder: Path | None = None
     failure: str | None = None
     streams_available: frozenset = frozenset()
@@ -130,6 +133,7 @@ class SessionController:
         self._reconnect_task: asyncio.Task | None = None
         self._battery_task: asyncio.Task | None = None
         self._deadline: float | None = None
+        self._retry_signal: asyncio.Event | None = None
         self._last_folder: Path | None = None
         self._failure: str | None = None
         self.stream_config = StreamConfig()
@@ -208,12 +212,14 @@ class SessionController:
             raise RuntimeError(f"cannot connect while {self.state.value}")
         self._failure = None
         self._refresh(state=State.CONNECTING, device=device, details=None, battery=None,
-                      contact=None)
+                      contact=None, connect_attempt=1,
+                      connect_attempts=len(self.start_delays))
         self._emit("state", f"Connecting to {device.name}")
         last: Exception | None = None
         for attempt, delay in enumerate(self.start_delays, 1):
             if delay:
                 await asyncio.sleep(delay)
+            self._refresh(connect_attempt=attempt)
             try:
                 details = await self._connect_once(device, rescan=attempt > 1)
                 break
@@ -221,14 +227,14 @@ class SessionController:
                 last = e
                 self._emit("warning", f"Connect attempt {attempt} failed: {e}")
         else:
-            self._refresh(state=State.IDLE)
+            self._refresh(state=State.IDLE, connect_attempt=0)
             self._emit("error", f"Could not connect to {device.name}: {last}")
             raise ConnectError(str(last))
         self.metrics = Metrics()
         self._conn_mono0 = self.clock.mono_ms()
         self._conn_wall0 = self.clock.wall_ms()
         self._active.clear()
-        self._refresh(state=State.CONNECTED, details=details)
+        self._refresh(state=State.CONNECTED, details=details, connect_attempt=0)
         self._emit("state", f"Connected to {device.name} (model {details.model or '?'}, "
                             f"firmware {details.firmware or '?'})")
         await self._apply_streams()
@@ -386,24 +392,27 @@ class SessionController:
                 self._storage_failed(e)
         loop = asyncio.get_running_loop()
         self._deadline = loop.time() + self.grace_s
-        self._refresh(state=State.RECONNECTING)
+        self._retry_signal = asyncio.Event()
+        self._refresh(state=State.RECONNECTING, reconnect_attempt=0)
         self._emit("warning", f"Connection lost; reconnecting for up to {self.grace_s} s")
         device = self.snap.device
         attempt = 0
         try:
-            while device is not None:
+            while device is not None and self._deadline and loop.time() < self._deadline:
                 delay = self.reconnect_delays[min(attempt, len(self.reconnect_delays) - 1)]
-                if loop.time() + delay >= self._deadline:
+                # never sleep past the deadline: the wait ends when the grace period does
+                await self._wait_before_retry(min(delay, self._deadline - loop.time()))
+                if not self._deadline or loop.time() >= self._deadline:
                     break
-                await asyncio.sleep(delay)
                 attempt += 1
+                self._refresh(reconnect_attempt=attempt)
                 try:
                     details = await self._connect_once(device, rescan=attempt > 1)
                 except ConnectError as e:
                     self._emit("state", f"Reconnect attempt {attempt} failed: {e}")
                     continue
                 self._deadline = None
-                self._refresh(state=State.CONNECTED, details=details)
+                self._refresh(state=State.CONNECTED, details=details, reconnect_attempt=0)
                 if self.writer:
                     try:
                         self.writer.reconnected({"model": details.model,
@@ -415,18 +424,39 @@ class SessionController:
                 await self._update_battery()
                 self._battery_task = asyncio.create_task(self._battery_loop())
                 return
-            # grace period over
-            remaining = self._deadline - loop.time() if self._deadline else 0
-            if remaining > 0:
-                await asyncio.sleep(remaining)
             self._deadline = None
             if self.writer:
                 self._finish_log("complete", "connection_timeout")
             await self.transport.disconnect()
-            self._refresh(state=State.IDLE)
+            self._refresh(state=State.IDLE, reconnect_attempt=0)
             self._emit("error", "Reconnect grace period expired; disconnected")
         finally:
             self._reconnect_task = None
+            self._retry_signal = None
+
+    async def _wait_before_retry(self, delay: float) -> None:
+        """Sleep, but wake early when the user asks for an immediate retry."""
+        sig = self._retry_signal
+        if sig is None:
+            await asyncio.sleep(delay)
+            return
+        try:
+            await asyncio.wait_for(sig.wait(), delay)
+        except asyncio.TimeoutError:
+            return
+        sig.clear()
+
+    def retry_now(self) -> None:
+        """Stop waiting and try to reconnect straight away (call on the loop thread)."""
+        if self._retry_signal is not None:
+            self._retry_signal.set()
+
+    def extend_grace(self, seconds: float) -> None:
+        """Give the strap more time to come back (call on the loop thread)."""
+        if self._deadline is None:
+            return
+        self._deadline += seconds
+        self._emit("info", f"Reconnect grace extended by {int(seconds)} s")
 
     # --- logging ---------------------------------------------------------------------------
     def start_log(self, opts: LogOptions) -> Path:
