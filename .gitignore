@@ -11,4 +11,5 @@ docs/superpowers/
 output_data/
 .superpowers/
 ble_test_tool.py
-PolarH10Logging/
+# recorded sessions: <participant>_<YYYYMMDD>_<HHMMSS>
+*_20[0-9][0-9][0-1][0-9][0-3][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9]/
