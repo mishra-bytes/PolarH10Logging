@@ -8,3 +8,4 @@ dist/
 excalidraw.log
 .coverage
 docs/superpowers/
+output_data/
